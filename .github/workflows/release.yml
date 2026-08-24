@@ -139,6 +139,20 @@ jobs:
           Write-Host "Using Visual Studio at: $vs"
           "vs2022_install=$vs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # patchWin32Dependencies (inside vscode-win32-x64-min) probes every PE
+      # with `signtool.exe verify` before rcedit; signtool ships in the
+      # Windows SDK but is NOT on PATH -> spawn ENOENT killed a run.
+      - name: Add signtool to PATH
+        shell: pwsh
+        run: |
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -like '*\x64' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found under $kits" }
+          Write-Host "Using $($signtool.FullName)"
+          Add-Content -Path $env:GITHUB_PATH -Value $signtool.DirectoryName
+
       - name: Install editor dependencies
         shell: bash
         working-directory: src
