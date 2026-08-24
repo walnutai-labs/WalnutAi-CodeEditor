@@ -34,9 +34,12 @@ name: Release Editor
 # real install with vswhere and exports vs2022_install — the escape hatch
 # preinstall.ts itself documents.
 #
-# NOT YET: code signing. Unsigned builds trip SmartScreen ("Windows protected
-# your PC" -> More info -> Run anyway). Add signtool + a cert before public
-# distribution.
+# Code signing: same scheme as walnut-agent — WIN_CSC_LINK (base64 PFX) +
+# WIN_CSC_KEY_PASSWORD repo secrets. When present, every packaged .exe and
+# the Inno installer are Authenticode-signed (SHA256 + RFC3161 timestamp).
+# When absent, the signing steps are skipped and the build ships unsigned
+# (SmartScreen: "More info" -> "Run anyway"). The embedded Inno UNINSTALLER
+# is not signed yet — that needs a SignTool= entry in the .iss (later).
 # ---------------------------------------------------------------------------
 
 on:
@@ -163,10 +166,48 @@ jobs:
         working-directory: src
         run: npm run gulp vscode-win32-x64-min
 
+      # ---- Signing (skipped when the cert secrets are not configured) ----------
+      # Sign BEFORE the installer is built so the installed files are signed,
+      # and AFTER vscode-win32-x64-min so rcedit's PE edits don't invalidate
+      # the signatures. Same cert as walnut-agent (base64 PFX in WIN_CSC_LINK).
+      - name: Sign application binaries
+        if: ${{ secrets.WIN_CSC_LINK != '' }}
+        shell: pwsh
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_CSC_LINK))
+          $targets = Get-ChildItem -Path "VSCode-win32-x64" -Recurse -Include *.exe
+          Write-Host "Signing $($targets.Count) executables"
+          foreach ($f in $targets) {
+            & signtool sign /f $pfx /p $env:WIN_CSC_KEY_PASSWORD /fd SHA256 `
+              /tr http://timestamp.digicert.com /td SHA256 $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signing failed: $($f.FullName)" }
+          }
+          Remove-Item $pfx
+
       - name: Build per-user installer (Inno Setup)
         shell: bash
         working-directory: src
         run: npm run gulp vscode-win32-x64-user-setup
+
+      - name: Sign installer
+        if: ${{ secrets.WIN_CSC_LINK != '' }}
+        shell: pwsh
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_CSC_LINK))
+          $setup = Get-ChildItem "src/.build/win32-x64/user-setup/*.exe" | Select-Object -First 1
+          & signtool sign /f $pfx /p $env:WIN_CSC_KEY_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 $setup.FullName
+          if ($LASTEXITCODE -ne 0) { throw "signing failed: $($setup.FullName)" }
+          & signtool verify /pa $setup.FullName
+          Remove-Item $pfx
 
       - name: Collect artifacts
         shell: bash
