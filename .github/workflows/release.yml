@@ -124,6 +124,14 @@ jobs:
           mkdir -p src/extensions/walnutai.walnut
           cp -R engine/dist/extension/. src/extensions/walnutai.walnut/
           rm -f src/extensions/walnutai.walnut/*.vsix
+          # The engine vendors ripgrep for every platform (~53MB). Keep only
+          # the Windows one: the others are dead weight AND kill the build —
+          # patchWin32Dependencies globs **/*.node and rcedit cannot load a
+          # Mach-O/ELF binary (alpha.3 died on arm64-darwin/ripgrep.node).
+          for d in src/extensions/walnutai.walnut/resources/vendor/ripgrep/*/; do
+            case "$(basename "$d")" in x64-win32) ;; *) rm -rf "$d" ;; esac
+          done
+          ls src/extensions/walnutai.walnut/resources/vendor/ripgrep/
 
       # ---- Editor: compile + package ------------------------------------------
       # preinstall.ts only probes Program Files for VS 2019/2022; find the
@@ -171,12 +179,12 @@ jobs:
       # and AFTER vscode-win32-x64-min so rcedit's PE edits don't invalidate
       # the signatures. Same cert as walnut-agent (base64 PFX in WIN_CSC_LINK).
       - name: Sign application binaries
-        if: ${{ secrets.WIN_CSC_LINK != '' }}
         shell: pwsh
         env:
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: |
+          if (-not $env:WIN_CSC_LINK) { Write-Host "WIN_CSC_LINK not set — shipping unsigned"; exit 0 }
           $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_CSC_LINK))
           $targets = Get-ChildItem -Path "VSCode-win32-x64" -Recurse -Include *.exe
@@ -194,12 +202,12 @@ jobs:
         run: npm run gulp vscode-win32-x64-user-setup
 
       - name: Sign installer
-        if: ${{ secrets.WIN_CSC_LINK != '' }}
         shell: pwsh
         env:
           WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
         run: |
+          if (-not $env:WIN_CSC_LINK) { Write-Host "WIN_CSC_LINK not set — shipping unsigned"; exit 0 }
           $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
           [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WIN_CSC_LINK))
           $setup = Get-ChildItem "src/.build/win32-x64/user-setup/*.exe" | Select-Object -First 1
