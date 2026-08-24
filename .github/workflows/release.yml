@@ -174,6 +174,14 @@ jobs:
         working-directory: src
         run: npm run gulp vscode-win32-x64-min
 
+      # The installer's [Files] section requires tools\inno_updater.exe in the
+      # package; upstream stages it with this separate task (alpha.4 died
+      # without it). Runs BEFORE signing so the updater exe gets signed too.
+      - name: Stage Inno updater tools
+        shell: bash
+        working-directory: src
+        run: npm run gulp vscode-win32-x64-inno-updater
+
       # ---- Signing (skipped when the cert secrets are not configured) ----------
       # Sign BEFORE the installer is built so the installed files are signed,
       # and AFTER vscode-win32-x64-min so rcedit's PE edits don't invalidate
