@@ -16,12 +16,23 @@ name: Release Editor
 #      REMEMBER: push the engine's cloud-agent branch before dispatching, or
 #      the build ships whatever the remote last saw.
 #
-# Trigger: Actions -> Release Editor -> Run workflow -> tag (already pushed
-# to GitLab, e.g. editor-v0.1.0). Tags with a "-suffix" become pre-releases.
+# Triggers (the tag must already exist in GITLAB — that is where source is
+# cloned from; the GitHub tag is only a marker on this release-shell repo):
+#   1. Actions -> Release Editor -> Run workflow -> tag (e.g. editor-v0.1.0)
+#   2. Pushing a tag named editor-v* to THIS repo (engine_ref defaults to
+#      cloud-agent). Lets contents-write tokens start a build without
+#      Actions permissions.
+# Tags with a "-suffix" become pre-releases.
 #
 # Outputs uploaded to the GitHub Release:
 #   WalnutAI-Setup-x64-<tag>.exe   (Inno Setup per-user installer)
 #   WalnutAI-win32-x64-<tag>.zip   (portable build; unzip and run WalnutAI.exe)
+#
+# GOTCHA (cost one run): the editor's build/npm/preinstall.ts only looks for
+# Visual Studio 2019/2022 at hardcoded Program Files paths and fails on
+# runners with a newer VS layout. The "Locate Visual Studio" step finds the
+# real install with vswhere and exports vs2022_install — the escape hatch
+# preinstall.ts itself documents.
 #
 # NOT YET: code signing. Unsigned builds trip SmartScreen ("Windows protected
 # your PC" -> More info -> Run anyway). Add signtool + a cert before public
@@ -38,9 +49,16 @@ on:
         description: "walnut-vscode ref for the bundled engine"
         required: true
         default: "cloud-agent"
+  push:
+    tags:
+      - "editor-v*"
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  ENGINE_REF: ${{ github.event.inputs.engine_ref || 'cloud-agent' }}
 
 jobs:
   create-release:
@@ -51,12 +69,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
           PRERELEASE=""
           case "$TAG" in *-*.*|*-alpha*|*-beta*|*-rc*|*-qa*|*-dev*) PRERELEASE="--prerelease" ;; esac
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --target main --title "$TAG" \
-              --notes "Automated build for $TAG (engine: ${{ github.event.inputs.engine_ref }})" $PRERELEASE
+              --notes "Automated build for $TAG (engine: $ENGINE_REF)" $PRERELEASE
           fi
 
   windows-x64:
@@ -68,7 +85,7 @@ jobs:
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
-          git clone --depth 1 --branch "${{ github.event.inputs.tag }}" \
+          git clone --depth 1 --branch "$TAG" \
             "https://oauth2:${GITLAB_TOKEN}@gitlab.devopsark.com/walnut/walnut-code-editor.git" src
 
       - name: Clone engine from GitLab
@@ -76,7 +93,7 @@ jobs:
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
-          git clone --depth 1 --branch "${{ github.event.inputs.engine_ref }}" \
+          git clone --depth 1 --branch "$ENGINE_REF" \
             "https://oauth2:${GITLAB_TOKEN}@gitlab.devopsark.com/walnut/walnut-vscode.git" engine
 
       - name: Set up Node.js (editor's pinned version)
@@ -106,6 +123,22 @@ jobs:
           rm -f src/extensions/walnutai.walnut/*.vsix
 
       # ---- Editor: compile + package ------------------------------------------
+      # preinstall.ts only probes Program Files for VS 2019/2022; find the
+      # actual toolchain and hand it over via the documented env override.
+      - name: Locate Visual Studio C++ toolchain
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found on this runner" }
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) {
+            Write-Host "vswhere found no install with VC tools; all installs:"
+            & $vswhere -all -products * -property installationPath
+            throw "No Visual Studio with the C++ toolchain on this runner"
+          }
+          Write-Host "Using Visual Studio at: $vs"
+          "vs2022_install=$vs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install editor dependencies
         shell: bash
         working-directory: src
@@ -124,7 +157,6 @@ jobs:
       - name: Collect artifacts
         shell: bash
         run: |
-          TAG="${{ github.event.inputs.tag }}"
           # vscode-win32-x64-min emits the app next to the repo checkout.
           7z a "WalnutAI-win32-x64-$TAG.zip" ./VSCode-win32-x64/*
           SETUP=$(ls src/.build/win32-x64/user-setup/*.exe | head -1)
@@ -137,5 +169,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
           gh release upload "$TAG" "WalnutAI-Setup-x64-$TAG.exe" "WalnutAI-win32-x64-$TAG.zip" --clobber
