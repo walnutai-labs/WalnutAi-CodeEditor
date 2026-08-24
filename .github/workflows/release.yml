@@ -1,0 +1,141 @@
+name: Release Editor
+
+# ---------------------------------------------------------------------------
+# WalnutAI Editor release pipeline — Windows x64 (first target).
+#
+# Same shape as the Walnut Agent pipeline: this workflow must live in the
+# GitHub repo (walnutai-labs), the SOURCE OF TRUTH stays in self-hosted
+# GitLab, and each runner clones it at build time. Nothing but releases and
+# this file live on GitHub.
+#
+# Two clones per build — the editor repo alone is NOT buildable:
+#   1. walnut-code-editor at the given tag (the fork; src/)
+#   2. walnut-vscode at engine_ref (the engine; engine/) — because
+#      extensions/walnutai.walnut/ is GITIGNORED build output in the editor
+#      repo and must be produced from the engine's dist/extension.
+#      REMEMBER: push the engine's cloud-agent branch before dispatching, or
+#      the build ships whatever the remote last saw.
+#
+# Trigger: Actions -> Release Editor -> Run workflow -> tag (already pushed
+# to GitLab, e.g. editor-v0.1.0). Tags with a "-suffix" become pre-releases.
+#
+# Outputs uploaded to the GitHub Release:
+#   WalnutAI-Setup-x64-<tag>.exe   (Inno Setup per-user installer)
+#   WalnutAI-win32-x64-<tag>.zip   (portable build; unzip and run WalnutAI.exe)
+#
+# NOT YET: code signing. Unsigned builds trip SmartScreen ("Windows protected
+# your PC" -> More info -> Run anyway). Add signtool + a cert before public
+# distribution.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Editor git tag to build (must already exist in GitLab), e.g. editor-v0.1.0"
+        required: true
+      engine_ref:
+        description: "walnut-vscode ref for the bundled engine"
+        required: true
+        default: "cloud-agent"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure the GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          PRERELEASE=""
+          case "$TAG" in *-*.*|*-alpha*|*-beta*|*-rc*|*-qa*|*-dev*) PRERELEASE="--prerelease" ;; esac
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target main --title "$TAG" \
+              --notes "Automated build for $TAG (engine: ${{ github.event.inputs.engine_ref }})" $PRERELEASE
+          fi
+
+  windows-x64:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - name: Clone editor from GitLab at tag
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.tag }}" \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.devopsark.com/walnut/walnut-code-editor.git" src
+
+      - name: Clone engine from GitLab
+        shell: bash
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone --depth 1 --branch "${{ github.event.inputs.engine_ref }}" \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.devopsark.com/walnut/walnut-vscode.git" engine
+
+      - name: Set up Node.js (editor's pinned version)
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: src/.nvmrc
+
+      # ---- Engine: build the bundled extension --------------------------------
+      # --legacy-peer-deps: the repo carries a known solid-js/opentui peer
+      # conflict; the team installs with this flag. `npm run build` (build-all)
+      # bundles the extension + webview + the built-in Common QA MCP; the
+      # Bun-only CLI build is skipped automatically outside Bun.
+      - name: Build engine extension
+        shell: bash
+        working-directory: engine
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+          test -f dist/extension/extension.js
+          test -f dist/extension/resources/common-qa-mcp/cli.bundle.js
+
+      - name: Bundle engine into editor (gitignored path, rsynced in dev)
+        shell: bash
+        run: |
+          mkdir -p src/extensions/walnutai.walnut
+          cp -R engine/dist/extension/. src/extensions/walnutai.walnut/
+          rm -f src/extensions/walnutai.walnut/*.vsix
+
+      # ---- Editor: compile + package ------------------------------------------
+      - name: Install editor dependencies
+        shell: bash
+        working-directory: src
+        run: npm ci
+
+      - name: Build Windows x64 package
+        shell: bash
+        working-directory: src
+        run: npm run gulp vscode-win32-x64-min
+
+      - name: Build per-user installer (Inno Setup)
+        shell: bash
+        working-directory: src
+        run: npm run gulp vscode-win32-x64-user-setup
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          # vscode-win32-x64-min emits the app next to the repo checkout.
+          7z a "WalnutAI-win32-x64-$TAG.zip" ./VSCode-win32-x64/*
+          SETUP=$(ls src/.build/win32-x64/user-setup/*.exe | head -1)
+          cp "$SETUP" "WalnutAI-Setup-x64-$TAG.exe"
+          ls -la WalnutAI-*
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          gh release upload "$TAG" "WalnutAI-Setup-x64-$TAG.exe" "WalnutAI-win32-x64-$TAG.zip" --clobber
